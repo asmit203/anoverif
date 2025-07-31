@@ -21,6 +21,43 @@
 
 namespace anoverif
 {
+    // Memory pool for efficient string allocation
+    class StringPool
+    {
+    private:
+        std::vector<std::unique_ptr<std::string>> pool_;
+        std::mutex pool_mutex_;
+        size_t pool_size_ = 0;
+        static constexpr size_t MAX_POOL_SIZE = 1000;
+
+    public:
+        std::unique_ptr<std::string> get()
+        {
+            std::lock_guard<std::mutex> lock(pool_mutex_);
+            if (!pool_.empty())
+            {
+                auto str = std::move(pool_.back());
+                pool_.pop_back();
+                pool_size_--;
+                str->clear();
+                return str;
+            }
+            return std::make_unique<std::string>();
+        }
+
+        void release(std::unique_ptr<std::string> str)
+        {
+            std::lock_guard<std::mutex> lock(pool_mutex_);
+            if (pool_size_ < MAX_POOL_SIZE)
+            {
+                str->clear();
+                str->shrink_to_fit();
+                pool_.push_back(std::move(str));
+                pool_size_++;
+            }
+        }
+    };
+
     // Struct to track pending requests
     struct PendingRequest
     {
@@ -65,6 +102,13 @@ namespace anoverif
         // Hash cache for improved performance (optional)
         std::unordered_map<std::string, std::string> hash_cache_;
         std::mutex cache_mutex_;
+
+        // Memory pool for efficient allocations
+        StringPool string_pool_;
+
+        // Pre-allocated JSON builders (thread-local storage)
+        thread_local static Json::StreamWriterBuilder json_builder_;
+        thread_local static Json::Reader json_reader_;
 
     public:
         AnonymizationServer(const Config &config)
@@ -185,11 +229,12 @@ namespace anoverif
                 if (!running_)
                     break;
 
-                // Get a batch of requests to process
+                // Get a batch of requests to process (optimized batch size)
                 std::vector<std::shared_ptr<PendingRequest>> batch;
-                while (!request_queue_.empty() && batch.size() < 10) // Process up to 10 at once
+                batch.reserve(20);                                   // Reserve space to avoid reallocations
+                while (!request_queue_.empty() && batch.size() < 20) // Increased batch size
                 {
-                    batch.push_back(request_queue_.front());
+                    batch.push_back(std::move(request_queue_.front()));
                     request_queue_.pop();
                 }
 
@@ -198,7 +243,7 @@ namespace anoverif
                 // Process requests with random delays for mixing
                 for (auto &request : batch)
                 {
-                    std::thread([this, request]()
+                    std::thread([this, request = std::move(request)]()
                                 {
                                     // Random delay to mix up request order
                                     int delay_ms = delay_dist_(gen_);
@@ -208,15 +253,14 @@ namespace anoverif
                                     Json::Value result = process_backend_request(request->original_idval);
 
                                     // Set the response
-                                    request->response_promise.set_value(result);
+                                    request->response_promise.set_value(std::move(result));
 
                                     // Remove from pending requests
                                     {
                                         std::lock_guard<std::mutex> pending_lock(pending_mutex_);
                                         pending_requests_.erase(request->request_hash);
                                         pending_count_--;
-                                    }
-                                })
+                                    } })
                         .detach();
                 }
             }
@@ -233,8 +277,8 @@ namespace anoverif
                 Json::Value backend_request;
                 backend_request["idval"] = original_idval; // Send original value
 
-                Json::StreamWriterBuilder builder;
-                std::string backend_data = Json::writeString(builder, backend_request);
+                // Use thread-local builder for efficiency
+                std::string backend_data = Json::writeString(json_builder_, backend_request);
 
                 auto response = http_client_->post(config_.backend_api_url, backend_data, "application/json");
 
@@ -247,10 +291,9 @@ namespace anoverif
                     return error_result;
                 }
 
-                // Parse backend response
-                Json::Reader reader;
+                // Parse backend response using thread-local reader
                 Json::Value backend_result;
-                if (!reader.parse(response.body, backend_result))
+                if (!json_reader_.parse(response.body, backend_result))
                 {
                     error_count_++;
                     Json::Value error_result;
@@ -316,7 +359,7 @@ namespace anoverif
             // Handle POST data
             if (*con_cls == nullptr)
             {
-                *con_cls = new std::string();
+                *con_cls = string_pool_.get().release(); // Use memory pool
                 return MHD_YES;
             }
 
@@ -332,7 +375,9 @@ namespace anoverif
             // Process the request
             std::string response = process_verification_request(*post_data);
 
-            delete post_data;
+            // Return to memory pool instead of delete
+            auto post_data_ptr = std::unique_ptr<std::string>(post_data);
+            string_pool_.release(std::move(post_data_ptr));
             *con_cls = nullptr;
 
             return send_json_response(connection, response);
@@ -342,11 +387,9 @@ namespace anoverif
         {
             try
             {
-                // Parse JSON request
+                // Parse JSON request using thread-local reader
                 Json::Value root;
-                Json::Reader reader;
-
-                if (!reader.parse(request_data, root))
+                if (!json_reader_.parse(request_data, root))
                 {
                     error_count_++;
                     return create_error_response("Invalid JSON");
@@ -358,7 +401,7 @@ namespace anoverif
                     return create_error_response("Missing or invalid 'idval' parameter");
                 }
 
-                std::string idval = root["idval"].asString();
+                const std::string &idval = root["idval"].asString(); // Use const reference
 
                 if (idval.empty())
                 {
@@ -407,9 +450,8 @@ namespace anoverif
                 // Get the result
                 Json::Value result = future.get();
 
-                // Convert to string response
-                Json::StreamWriterBuilder builder;
-                return Json::writeString(builder, result);
+                // Convert to string response using thread-local builder
+                return Json::writeString(json_builder_, result);
             }
             catch (const std::exception &e)
             {
@@ -434,13 +476,19 @@ namespace anoverif
             std::string salted_input = config_.hash_salt + input + config_.hash_salt;
             std::string hash = HashUtils::sha256_hash(salted_input);
 
-            // Cache the result (with size limit)
+            // Cache the result with LRU-style eviction
             {
                 std::lock_guard<std::mutex> lock(cache_mutex_);
-                if (hash_cache_.size() < 10000)
-                { // Limit cache size
-                    hash_cache_[input] = hash;
+                if (hash_cache_.size() >= 10000)
+                {
+                    // Simple eviction: remove oldest entries (first 1000)
+                    auto it = hash_cache_.begin();
+                    for (int i = 0; i < 1000 && it != hash_cache_.end(); ++i)
+                    {
+                        it = hash_cache_.erase(it);
+                    }
                 }
+                hash_cache_[input] = hash;
             }
 
             return hash;
@@ -456,8 +504,8 @@ namespace anoverif
                     std::chrono::system_clock::now().time_since_epoch())
                     .count());
 
-            Json::StreamWriterBuilder builder;
-            return Json::writeString(builder, response);
+            // Use thread-local builder for efficiency
+            return Json::writeString(json_builder_, response);
         }
 
         MHD_Result send_json_response(struct MHD_Connection *connection, const std::string &json)
@@ -521,6 +569,10 @@ namespace anoverif
     };
 
 } // namespace anoverif
+
+// Thread-local storage definitions
+thread_local Json::StreamWriterBuilder anoverif::AnonymizationServer::json_builder_;
+thread_local Json::Reader anoverif::AnonymizationServer::json_reader_;
 
 // Global server instance for signal handling
 std::unique_ptr<anoverif::AnonymizationServer> g_server;
