@@ -19,8 +19,8 @@ namespace anoverif
         int port_;
         std::atomic<bool> running_;
 
-        // Simulate a database of "valid" hashes
-        std::unordered_set<std::string> valid_hashes_;
+        // Simulate a database of "valid" idvals (not hashes!)
+        std::unordered_set<std::string> valid_hashes_; // TODO: rename to valid_idvals_
         std::mutex hashes_mutex_;
 
         // Random number generator for simulation
@@ -94,41 +94,43 @@ namespace anoverif
             std::cout << "  Total Requests: " << request_count_.load() << std::endl;
             std::cout << "  True Responses: " << true_responses_.load() << std::endl;
             std::cout << "  False Responses: " << false_responses_.load() << std::endl;
-            std::cout << "  Valid Hashes in DB: " << valid_hashes_.size() << std::endl;
+            std::cout << "  Valid IDVals in DB: " << valid_hashes_.size() << std::endl;
         }
 
     private:
         void seed_valid_hashes()
         {
-            // Add some predefined valid hashes for testing
+            // Add some predefined valid idvals for testing
             std::lock_guard<std::mutex> lock(hashes_mutex_);
 
-            // These would represent hashed versions of "valid" identifiers
-            valid_hashes_.insert("a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3"); // "hello"
-            valid_hashes_.insert("2cf24dba4f21d4288094c45ed0e15b1b2c9c4bc6d2f5e06e0a4c7b5bd2c7e0d4"); // "hello" with salt
-            valid_hashes_.insert("ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d"); // "test"
-            valid_hashes_.insert("9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"); // "test" with salt
+            // These represent "valid" identifiers that would be verified as true
+            valid_hashes_.insert("user123");
+            valid_hashes_.insert("admin456");
+            valid_hashes_.insert("test_user");
+            valid_hashes_.insert("valid_id_001");
+            valid_hashes_.insert("authorized_user");
+            valid_hashes_.insert("premium_member");
+            valid_hashes_.insert("verified_account");
 
-            // Add some random valid hashes
-            for (int i = 0; i < 100; i++)
+            // Add some random valid idvals
+            for (int i = 0; i < 50; i++)
             {
-                std::string hash = generate_random_hash();
-                valid_hashes_.insert(hash);
+                std::string idval = generate_random_idval();
+                valid_hashes_.insert(idval);
             }
         }
 
-        std::string generate_random_hash()
+        std::string generate_random_idval()
         {
-            const char *hex_chars = "0123456789abcdef";
-            std::string hash;
-            hash.reserve(64);
+            const char *chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+            std::string idval = "user_";
 
-            for (int i = 0; i < 64; i++)
+            for (int i = 0; i < 8; i++)
             {
-                hash += hex_chars[dis_(gen_) % 16];
+                idval += chars[dis_(gen_) % 36];
             }
 
-            return hash;
+            return idval;
         }
 
         static MHD_Result request_handler(void *cls, struct MHD_Connection *connection,
@@ -218,18 +220,18 @@ namespace anoverif
                     return create_error_response("Invalid JSON");
                 }
 
-                if (!root.isMember("hash") || !root["hash"].isString())
+                if (!root.isMember("idval") || !root["idval"].isString())
                 {
-                    return create_error_response("Missing or invalid 'hash' parameter");
+                    return create_error_response("Missing or invalid 'idval' parameter");
                 }
 
-                std::string hash = root["hash"].asString();
+                std::string idval = root["idval"].asString();
 
                 // Simulate processing delay (1-10ms)
                 std::this_thread::sleep_for(std::chrono::milliseconds(dis_(gen_) % 10 + 1));
 
-                // Check if hash is in our "database" or use probabilistic response
-                bool result = is_hash_valid(hash);
+                // Check if idval is in our "database" or use probabilistic response
+                bool result = is_idval_valid(idval);
 
                 if (result)
                 {
@@ -240,10 +242,10 @@ namespace anoverif
                     false_responses_++;
                 }
 
-                // Create response
+                // Create response (note: we return result but don't expose the idval for privacy)
                 Json::Value response;
                 response["result"] = result;
-                response["hash"] = hash;
+                response["verified"] = result; // Additional field for clarity
                 response["timestamp"] = static_cast<int64_t>(
                     std::chrono::duration_cast<std::chrono::seconds>(
                         std::chrono::system_clock::now().time_since_epoch())
@@ -259,12 +261,12 @@ namespace anoverif
             }
         }
 
-        bool is_hash_valid(const std::string &hash)
+        bool is_idval_valid(const std::string &idval)
         {
             std::lock_guard<std::mutex> lock(hashes_mutex_);
 
-            // Check if hash is in our predefined valid set
-            if (valid_hashes_.find(hash) != valid_hashes_.end())
+            // Check if idval is in our predefined valid set
+            if (valid_hashes_.find(idval) != valid_hashes_.end())
             {
                 return true;
             }

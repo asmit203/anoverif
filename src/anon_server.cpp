@@ -10,6 +10,10 @@
 #include <signal.h>
 #include <cstring>
 #include <fstream>
+#include <queue>
+#include <condition_variable>
+#include <future>
+#include <random>
 
 #include "hash_utils.h"
 #include "http_client.h"
@@ -17,6 +21,18 @@
 
 namespace anoverif
 {
+    // Struct to track pending requests
+    struct PendingRequest
+    {
+        std::string request_hash;
+        std::string original_idval;
+        std::chrono::steady_clock::time_point created_at;
+        std::promise<Json::Value> response_promise;
+
+        PendingRequest(const std::string &hash, const std::string &idval)
+            : request_hash(hash), original_idval(idval),
+              created_at(std::chrono::steady_clock::now()) {}
+    };
 
     class AnonymizationServer
     {
@@ -27,10 +43,24 @@ namespace anoverif
         std::unique_ptr<HttpClient> http_client_;
         std::atomic<bool> running_;
 
+        // Async request processing
+        std::queue<std::shared_ptr<PendingRequest>> request_queue_;
+        std::unordered_map<std::string, std::shared_ptr<PendingRequest>> pending_requests_;
+        std::mutex queue_mutex_;
+        std::mutex pending_mutex_;
+        std::condition_variable queue_cv_;
+        std::thread processing_thread_;
+
+        // Request mixing parameters
+        std::random_device rd_;
+        std::mt19937 gen_;
+        std::uniform_int_distribution<> delay_dist_;
+
         // Performance monitoring
         std::atomic<uint64_t> request_count_;
         std::atomic<uint64_t> success_count_;
         std::atomic<uint64_t> error_count_;
+        std::atomic<uint64_t> pending_count_;
 
         // Hash cache for improved performance (optional)
         std::unordered_map<std::string, std::string> hash_cache_;
@@ -39,7 +69,8 @@ namespace anoverif
     public:
         AnonymizationServer(const Config &config)
             : daemon_(nullptr), ssl_daemon_(nullptr), config_(config), running_(false),
-              request_count_(0), success_count_(0), error_count_(0)
+              gen_(rd_()), delay_dist_(100, 2000), // 100ms to 2s random delay
+              request_count_(0), success_count_(0), error_count_(0), pending_count_(0)
         {
             http_client_ = std::make_unique<HttpClient>();
             http_client_->set_timeout(config_.backend_timeout_ms);
@@ -53,6 +84,9 @@ namespace anoverif
         bool start()
         {
             running_ = true;
+
+            // Start async processing thread
+            processing_thread_ = std::thread(&AnonymizationServer::process_requests, this);
 
             // Start HTTP server
             daemon_ = MHD_start_daemon(
@@ -102,6 +136,15 @@ namespace anoverif
         {
             running_ = false;
 
+            // Wake up processing thread
+            queue_cv_.notify_all();
+
+            // Wait for processing thread to finish
+            if (processing_thread_.joinable())
+            {
+                processing_thread_.join();
+            }
+
             if (daemon_)
             {
                 MHD_stop_daemon(daemon_);
@@ -121,10 +164,124 @@ namespace anoverif
             std::cout << "  Total Requests: " << request_count_.load() << std::endl;
             std::cout << "  Successful: " << success_count_.load() << std::endl;
             std::cout << "  Errors: " << error_count_.load() << std::endl;
+            std::cout << "  Pending Requests: " << pending_count_.load() << std::endl;
             std::cout << "  Cache Size: " << hash_cache_.size() << std::endl;
         }
 
     private:
+        // Async request processing thread
+        void process_requests()
+        {
+            std::cout << "Started async request processing thread" << std::endl;
+
+            while (running_)
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex_);
+
+                // Wait for requests or shutdown signal
+                queue_cv_.wait(lock, [this]
+                               { return !request_queue_.empty() || !running_; });
+
+                if (!running_)
+                    break;
+
+                // Get a batch of requests to process
+                std::vector<std::shared_ptr<PendingRequest>> batch;
+                while (!request_queue_.empty() && batch.size() < 10) // Process up to 10 at once
+                {
+                    batch.push_back(request_queue_.front());
+                    request_queue_.pop();
+                }
+
+                lock.unlock();
+
+                // Process requests with random delays for mixing
+                for (auto &request : batch)
+                {
+                    std::thread([this, request]()
+                                {
+                                    // Random delay to mix up request order
+                                    int delay_ms = delay_dist_(gen_);
+                                    std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+
+                                    // Process the request
+                                    Json::Value result = process_backend_request(request->original_idval);
+
+                                    // Set the response
+                                    request->response_promise.set_value(result);
+
+                                    // Remove from pending requests
+                                    {
+                                        std::lock_guard<std::mutex> pending_lock(pending_mutex_);
+                                        pending_requests_.erase(request->request_hash);
+                                        pending_count_--;
+                                    }
+                                })
+                        .detach();
+                }
+            }
+
+            std::cout << "Async request processing thread stopped" << std::endl;
+        }
+
+        // Process request with backend API (original idval, not hash)
+        Json::Value process_backend_request(const std::string &original_idval)
+        {
+            try
+            {
+                // Forward original idval to backend API (not hash!)
+                Json::Value backend_request;
+                backend_request["idval"] = original_idval; // Send original value
+
+                Json::StreamWriterBuilder builder;
+                std::string backend_data = Json::writeString(builder, backend_request);
+
+                auto response = http_client_->post(config_.backend_api_url, backend_data, "application/json");
+
+                if (!response.success)
+                {
+                    error_count_++;
+                    Json::Value error_result;
+                    error_result["success"] = false;
+                    error_result["error"] = "Backend API unavailable";
+                    return error_result;
+                }
+
+                // Parse backend response
+                Json::Reader reader;
+                Json::Value backend_result;
+                if (!reader.parse(response.body, backend_result))
+                {
+                    error_count_++;
+                    Json::Value error_result;
+                    error_result["success"] = false;
+                    error_result["error"] = "Invalid backend response";
+                    return error_result;
+                }
+
+                success_count_++;
+
+                // Return successful result
+                Json::Value client_response;
+                client_response["success"] = true;
+                client_response["result"] = backend_result.get("result", false).asBool();
+                client_response["timestamp"] = static_cast<int64_t>(
+                    std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count());
+
+                return client_response;
+            }
+            catch (const std::exception &e)
+            {
+                error_count_++;
+                Json::Value error_result;
+                error_result["success"] = false;
+                error_result["error"] = std::string("Processing error: ") + e.what();
+                return error_result;
+            }
+        }
+
         static MHD_Result request_handler(void *cls, struct MHD_Connection *connection,
                                           const char *url, const char *method,
                                           const char *version, const char *upload_data,
@@ -209,44 +366,50 @@ namespace anoverif
                     return create_error_response("Empty 'idval' parameter");
                 }
 
-                // Hash the sensitive data
-                std::string hashed_value = hash_with_cache(idval);
+                // Create hash for request tracking (but send original idval to backend)
+                std::string request_hash = hash_with_cache(idval);
 
-                // Forward to backend API
-                Json::Value backend_request;
-                backend_request["hash"] = hashed_value;
+                // Create pending request
+                auto pending_request = std::make_shared<PendingRequest>(request_hash, idval);
+                auto future = pending_request->response_promise.get_future();
 
+                // Add to pending requests and queue
+                {
+                    std::lock_guard<std::mutex> pending_lock(pending_mutex_);
+                    pending_requests_[request_hash] = pending_request;
+                    pending_count_++;
+                }
+
+                {
+                    std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+                    request_queue_.push(pending_request);
+                }
+
+                // Notify processing thread
+                queue_cv_.notify_one();
+
+                // Wait for async response (with timeout)
+                auto status = future.wait_for(std::chrono::milliseconds(config_.backend_timeout_ms + 3000));
+
+                if (status == std::future_status::timeout)
+                {
+                    // Cleanup on timeout
+                    {
+                        std::lock_guard<std::mutex> pending_lock(pending_mutex_);
+                        pending_requests_.erase(request_hash);
+                        pending_count_--;
+                    }
+
+                    error_count_++;
+                    return create_error_response("Request timeout");
+                }
+
+                // Get the result
+                Json::Value result = future.get();
+
+                // Convert to string response
                 Json::StreamWriterBuilder builder;
-                std::string backend_data = Json::writeString(builder, backend_request);
-
-                auto response = http_client_->post(config_.backend_api_url, backend_data, "application/json");
-
-                if (!response.success)
-                {
-                    error_count_++;
-                    return create_error_response("Backend API unavailable");
-                }
-
-                // Parse backend response
-                Json::Value backend_result;
-                if (!reader.parse(response.body, backend_result))
-                {
-                    error_count_++;
-                    return create_error_response("Invalid backend response");
-                }
-
-                success_count_++;
-
-                // Return the result to client
-                Json::Value client_response;
-                client_response["success"] = true;
-                client_response["result"] = backend_result.get("result", false).asBool();
-                client_response["timestamp"] = static_cast<int64_t>(
-                    std::chrono::duration_cast<std::chrono::seconds>(
-                        std::chrono::system_clock::now().time_since_epoch())
-                        .count());
-
-                return Json::writeString(builder, client_response);
+                return Json::writeString(builder, result);
             }
             catch (const std::exception &e)
             {
