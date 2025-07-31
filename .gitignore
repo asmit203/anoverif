@@ -1,0 +1,114 @@
+# Build directories
+build/
+cmake-build-*/
+bin/
+obj/
+out/
+
+# Compiled binaries
+*.exe
+*.out
+*.app
+anon_server
+dummy_api
+test_client
+
+# Build artifacts
+*.o
+*.obj
+*.so
+*.a
+*.dylib
+*.dll
+*.lib
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+install_manifest.txt
+CTestTestfile.cmake
+_deps/
+
+# IDE files
+.vscode/
+.vs/
+.idea/
+*.vcxproj*
+*.sln
+*.user
+*.suo
+*.ncb
+*.aps
+*.plg
+*.opt
+*.clw
+*.tags
+*.iml
+*.ipr
+*.iws
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Package managers
+vcpkg_installed/
+conan/
+.conan/
+
+# Dependencies
+deps/
+third_party/
+external/
+lib/
+
+# SSL certificates (for development)
+*.crt
+*.key
+*.pem
+*.p12
+
+# Log files
+*.log
+*.dmp
+
+# Temporary files
+*.tmp
+*.temp
+
+# Core dumps
+core
+core.*
+
+# Test results
+test_results/
+coverage/
+*.gcov
+*.gcda
+*.gcno
+
+# Backup files
+*.bak
+*.backup
+*.orig
+config.txt.bak
+*.conf.bak
+
+# Compressed files
+*.zip
+*.tar.gz
+*.tar.bz2
+*.7z
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Docker
+.dockerignore

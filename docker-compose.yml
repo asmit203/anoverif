@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  dummy-api:
+    build: .
+    container_name: anoverif-dummy-api
+    entrypoint: ["./build/dummy_api"]
+    ports:
+      - "9090:9090"
+    environment:
+      - PORT=9090
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  anon-server:
+    build: .
+    container_name: anoverif-anon-server
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+    environment:
+      - ANON_PORT=8080
+      - ANON_SSL_PORT=8443
+      - ANON_BACKEND_URL=http://dummy-api:9090/verify
+      - ANON_HASH_SALT=anoverif_docker_salt_2024
+      - ANON_MAX_CONNECTIONS=1000
+    depends_on:
+      dummy-api:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  test-client:
+    build: .
+    container_name: anoverif-test-client
+    entrypoint: ["./build/test_client", "--url", "http://anon-server:8080/verify", "--load", "--requests", "1000", "--concurrency", "10"]
+    depends_on:
+      anon-server:
+        condition: service_healthy
+    profiles:
+      - test

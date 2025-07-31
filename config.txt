@@ -1,0 +1,13 @@
+# Anoverif Configuration File
+port=8080
+ssl_port=8443
+bind_address=0.0.0.0
+backend_api_url=http://localhost:9090/verify
+ssl_cert_file=server.crt
+ssl_key_file=server.key
+enable_ssl=false
+max_connections=1000
+thread_pool_size=0
+connection_timeout=30
+backend_timeout_ms=5000
+hash_salt=anoverif_secure_salt_2024
