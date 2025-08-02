@@ -70,5 +70,15 @@ target_link_libraries(test_client
     Threads::Threads
 )
 
+# Build the advanced benchmark
+add_executable(advanced_benchmark src/advanced_benchmark.cpp)
+target_link_libraries(advanced_benchmark ${CURL_LIBRARIES} ${JSONCPP_LIBRARIES})
+target_include_directories(advanced_benchmark PRIVATE ${CURL_INCLUDE_DIRS} ${JSONCPP_INCLUDE_DIRS})
+
+# Build the simple timing benchmark
+add_executable(simple_timing_benchmark src/simple_timing_benchmark.cpp)
+target_link_libraries(simple_timing_benchmark ${CURL_LIBRARIES} ${JSONCPP_LIBRARIES})
+target_include_directories(simple_timing_benchmark PRIVATE ${CURL_INCLUDE_DIRS} ${JSONCPP_INCLUDE_DIRS})
+
 # Create src directory
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src)

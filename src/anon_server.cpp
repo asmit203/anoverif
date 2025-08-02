@@ -21,42 +21,6 @@
 
 namespace anoverif
 {
-    // Memory pool for efficient string allocation
-    class StringPool
-    {
-    private:
-        std::vector<std::unique_ptr<std::string>> pool_;
-        std::mutex pool_mutex_;
-        size_t pool_size_ = 0;
-        static constexpr size_t MAX_POOL_SIZE = 1000;
-
-    public:
-        std::unique_ptr<std::string> get()
-        {
-            std::lock_guard<std::mutex> lock(pool_mutex_);
-            if (!pool_.empty())
-            {
-                auto str = std::move(pool_.back());
-                pool_.pop_back();
-                pool_size_--;
-                str->clear();
-                return str;
-            }
-            return std::make_unique<std::string>();
-        }
-
-        void release(std::unique_ptr<std::string> str)
-        {
-            std::lock_guard<std::mutex> lock(pool_mutex_);
-            if (pool_size_ < MAX_POOL_SIZE)
-            {
-                str->clear();
-                str->shrink_to_fit();
-                pool_.push_back(std::move(str));
-                pool_size_++;
-            }
-        }
-    };
 
     // Struct to track pending requests
     struct PendingRequest
@@ -102,9 +66,6 @@ namespace anoverif
         // Hash cache for improved performance (optional)
         std::unordered_map<std::string, std::string> hash_cache_;
         std::mutex cache_mutex_;
-
-        // Memory pool for efficient allocations
-        StringPool string_pool_;
 
         // Pre-allocated JSON builders (thread-local storage)
         thread_local static Json::StreamWriterBuilder json_builder_;
@@ -229,10 +190,10 @@ namespace anoverif
                 if (!running_)
                     break;
 
-                // Get a batch of requests to process (optimized batch size)
+                // Get a batch of requests to process (conservative batch size)
                 std::vector<std::shared_ptr<PendingRequest>> batch;
-                batch.reserve(20);                                   // Reserve space to avoid reallocations
-                while (!request_queue_.empty() && batch.size() < 20) // Increased batch size
+                batch.reserve(5);                                   // Smaller batch size for stability
+                while (!request_queue_.empty() && batch.size() < 5) // Process in smaller batches
                 {
                     batch.push_back(std::move(request_queue_.front()));
                     request_queue_.pop();
@@ -240,28 +201,47 @@ namespace anoverif
 
                 lock.unlock();
 
-                // Process requests with random delays for mixing
+                // Process requests with minimal delay for better performance
                 for (auto &request : batch)
                 {
-                    std::thread([this, request = std::move(request)]()
-                                {
-                                    // Random delay to mix up request order
-                                    int delay_ms = delay_dist_(gen_);
-                                    std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+                    // Use a simpler approach - process in the same thread with minimal delay
+                    try
+                    {
+                        // Small delay to still provide some request mixing
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
-                                    // Process the request
-                                    Json::Value result = process_backend_request(request->original_idval);
+                        // Process the request
+                        Json::Value result = process_backend_request(request->original_idval);
 
-                                    // Set the response
-                                    request->response_promise.set_value(std::move(result));
+                        // Set the response
+                        request->response_promise.set_value(std::move(result));
+                    }
+                    catch (const std::exception &)
+                    {
+                        try
+                        {
+                            Json::Value error_result;
+                            error_result["success"] = false;
+                            error_result["error"] = "Processing failed";
+                            request->response_promise.set_value(std::move(error_result));
+                        }
+                        catch (...)
+                        {
+                            // If setting promise fails, just continue
+                        }
+                    }
 
-                                    // Remove from pending requests
-                                    {
-                                        std::lock_guard<std::mutex> pending_lock(pending_mutex_);
-                                        pending_requests_.erase(request->request_hash);
-                                        pending_count_--;
-                                    } })
-                        .detach();
+                    // Remove from pending requests
+                    try
+                    {
+                        std::lock_guard<std::mutex> pending_lock(pending_mutex_);
+                        pending_requests_.erase(request->request_hash);
+                        pending_count_--;
+                    }
+                    catch (...)
+                    {
+                        // Continue if cleanup fails
+                    }
                 }
             }
 
@@ -344,6 +324,12 @@ namespace anoverif
 
             request_count_++;
 
+            // Simple rate limiting - reject if too many pending requests
+            if (pending_count_.load() > 500)
+            {
+                return send_error_response(connection, 503, "Server too busy, try again later");
+            }
+
             // Handle CORS preflight
             if (strcmp(method, "OPTIONS") == 0)
             {
@@ -356,14 +342,18 @@ namespace anoverif
                 return send_error_response(connection, 404, "Not Found");
             }
 
-            // Handle POST data
+            // Handle POST data - use simple memory management
             if (*con_cls == nullptr)
             {
-                *con_cls = string_pool_.get().release(); // Use memory pool
+                *con_cls = new std::string();
                 return MHD_YES;
             }
 
             auto *post_data = static_cast<std::string *>(*con_cls);
+            if (!post_data)
+            {
+                return send_error_response(connection, 500, "Invalid request state");
+            }
 
             if (*upload_data_size != 0)
             {
@@ -372,12 +362,19 @@ namespace anoverif
                 return MHD_YES;
             }
 
-            // Process the request
-            std::string response = process_verification_request(*post_data);
+            // Process the request with error handling
+            std::string response;
+            try
+            {
+                response = process_verification_request(*post_data);
+            }
+            catch (const std::exception &)
+            {
+                response = create_error_response("Request processing failed");
+            }
 
-            // Return to memory pool instead of delete
-            auto post_data_ptr = std::unique_ptr<std::string>(post_data);
-            string_pool_.release(std::move(post_data_ptr));
+            // Simple cleanup - just delete
+            delete post_data;
             *con_cls = nullptr;
 
             return send_json_response(connection, response);
